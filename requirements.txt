@@ -1,0 +1,10 @@
+# Shop Desk runtime dependencies (pinned to the versions verified for Task 1).
+openai-agents==0.22.3
+chainlit==2.11.0
+python-dotenv==1.2.3
+# Windows has no system tz database; stdlib zoneinfo requires this package
+# (used by the router's RPD cooldown-to-Pacific-midnight computation).
+tzdata==2026.4
+
+# Test dependencies
+pytest==9.1.1

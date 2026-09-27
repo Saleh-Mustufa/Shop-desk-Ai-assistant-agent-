@@ -1,0 +1,12 @@
+{
+  "shop": "Al-Noor Electronics",
+  "currency": "PKR",
+  "products": [
+    {"sku": "KTL-01", "name": "Electric kettle 1.7L", "price": 4200, "stock": 12},
+    {"sku": "FAN-22", "name": "Pedestal fan", "price": 9800, "stock": 0},
+    {"sku": "TV-43S", "name": "43-inch LED smart TV", "price": 74500, "stock": 5},
+    {"sku": "MIC-30", "name": "Microwave oven 30L", "price": 23500, "stock": 8},
+    {"sku": "IRN-12", "name": "Steam iron", "price": 3600, "stock": 20},
+    {"sku": "BLD-07", "name": "Blender 3-in-1", "price": 6900, "stock": 3}
+  ]
+}
