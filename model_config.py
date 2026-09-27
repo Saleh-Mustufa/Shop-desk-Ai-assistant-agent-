@@ -14,6 +14,11 @@ Serves:
   reason) to logger "shopdesk.router".
 - Spec "Router mechanics": Gemini via its OpenAI-compatible endpoint, wrapped
   in a custom RoutedModel implementing the SDK Model protocol.
+
+Scope note (controller ruling): automatic switching (backoff, RPD cooldown,
+capacity skipping) lives on the non-streaming `get_response` path ONLY.
+`stream_response` delegates to the active candidate with no switching — the
+app runs non-streaming `Runner.run`, so there is no parity requirement.
 """
 
 from __future__ import annotations
@@ -302,7 +307,13 @@ def _record_success(name: str, response: object) -> None:
 
 
 def _has_local_capacity(name: str) -> tuple[bool, str]:
-    """True when the model is within its locally observed limits."""
+    """True when the model is within its locally observed limits.
+
+    Prunes expired entries at read time: a model that was skipped never
+    records new successes, so without read-time pruning its windows would
+    never free up (worst case: RPD-exhausted stays dead after the reset).
+    """
+    _prune(name, time.monotonic())
     entry = MODEL_REGISTRY[name]
     rpm_calls = _usage_rpm.get(name)
     if entry.rpm and rpm_calls and len(rpm_calls) >= entry.rpm:
@@ -411,8 +422,11 @@ class RoutedModel(Model):
     def _skip_reason(self, name: str) -> str | None:
         """Why a candidate must not be attempted now (cooldown / local limits)."""
         until = _cooldown_until.get(name)
-        if until is not None and datetime.now(timezone.utc) < until:
-            return f"daily quota (rpd) cooldown until {until.isoformat()}"
+        if until is not None:
+            if datetime.now(timezone.utc) < until:
+                return f"daily quota (rpd) cooldown until {until.isoformat()}"
+            # Cooldown has passed (daily reset) — clear it so the model can serve again.
+            _cooldown_until.pop(name, None)
         has_capacity, reason = _has_local_capacity(name)
         return None if has_capacity else reason
 
@@ -524,7 +538,12 @@ class RoutedModel(Model):
         conversation_id: str | None = None,
         prompt: ResponsePromptParam | None = None,
     ) -> AsyncIterator[TResponseStreamEvent]:
-        """Minimal streaming: delegate to the active candidate (§7 covers non-streaming switching)."""
+        """Stream via the active candidate only — NO automatic switching.
+
+        Switching, backoff and capacity/cooldown checks are deliberately a
+        non-streaming `get_response` carve-in (controller ruling); the app
+        uses non-streaming Runner.run, so the streaming path needs none.
+        """
         return self._delegate_for(self.active_model_name).stream_response(
             system_instructions,
             input,

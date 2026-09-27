@@ -12,7 +12,9 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
+import time
 from collections import deque
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -413,6 +415,38 @@ class TestSwitching:
         _get_response(routed)
         # Candidate 1 is locally exhausted -> candidate 2 serves without attempts on 1.
         assert routed.active_model_name == chain[1]
+
+    def test_window_elapsed_makes_model_usable_again(self):
+        """Read-time pruning: expired window entries must not block the model forever."""
+        chain = model_config.resolve_chain("fast")
+        name = chain[0]
+        entry = model_config.MODEL_REGISTRY[name]
+        stale = time.monotonic() - (model_config.RPM_WINDOW_SECONDS + 1)
+        model_config._usage_rpm[name] = deque([stale] * entry.rpm)
+        # Sanity: with only stale entries the model would have been skipped forever
+        # before read-time pruning (a skipped model never records new successes).
+        routed = model_config.RoutedModel(
+            "fast", delegate_factory=lambda n: FakeModel([_model_response()])
+        )
+        _get_response(routed)
+        # The expired window was pruned at read time -> candidate 1 serves again.
+        assert routed.active_model_name == name
+        # Stale entries were dropped on read; only the fresh success remains.
+        remaining = model_config._usage_rpm[name]
+        assert len(remaining) == 1
+        assert time.monotonic() - remaining[0] < model_config.RPM_WINDOW_SECONDS
+
+    def test_expired_rpd_cooldown_is_cleared_on_read(self):
+        """An RPD cooldown whose reset instant has passed is removed, not just ignored."""
+        chain = model_config.resolve_chain("fast")
+        name = chain[0]
+        model_config._cooldown_until[name] = datetime.now(timezone.utc) - timedelta(seconds=1)
+        routed = model_config.RoutedModel(
+            "fast", delegate_factory=lambda n: FakeModel([_model_response()])
+        )
+        _get_response(routed)
+        assert routed.active_model_name == name
+        assert name not in model_config._cooldown_until
 
     def test_reset_state_clears_counters_and_cooldowns(self):
         chain = model_config.resolve_chain("fast")
