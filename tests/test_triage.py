@@ -188,12 +188,14 @@ def test_desk_agent_shape():
     assert agent.name == "ShopDesk"
     assert agent.tool_use_behavior == "run_llm_again"  # ordinary loop (FR-3 contrast)
     assert agent.instructions is prompts.desk_instructions  # the callable itself
+    # The five shop tools plus the FR-8 pricing-specialist quote tool.
     assert _tool_names(agent) == {
         "lookup_product",
         "check_stock_by_name",
         "list_catalogue",
         "loyalty_benefit",
         "holiday_bundles",
+        "get_price_quote",
     }
     assert isinstance(agent.model, model_config.RoutedModel)
 
