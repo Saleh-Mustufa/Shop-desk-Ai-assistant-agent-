@@ -11,7 +11,9 @@ A turn takes the fast path only when ALL of these hold:
 
 (a) it is short: at most :data:`MAX_CHARS` characters (stripped) and at most
     :data:`MAX_SENTENCES` sentences;
-(b) it contains no order/intent word (:data:`ORDER_WORDS`, case-insensitive);
+(b) it contains no order/intent word (:data:`ORDER_WORDS`, case-insensitive,
+    with -s/-es/-ing/-ed inflections folded, so "shipping"/"delivered" guard
+    the same as "ship"/"deliver");
 (c) it carries price/stock intent (:data:`PRICE_STOCK_PATTERN`,
     case-insensitive) — OR it names a valid product code directly
     (:data:`SKU_PATTERN` validated against ``catalogue.get_product``), because
@@ -136,13 +138,41 @@ def _singularize(word: str) -> str:
     return word
 
 
+def _fold_to_order_stem(token: str) -> str | None:
+    """Fold an inflected token onto an ORDER_WORDS stem, or return None.
+
+    Catches -s/-es plurals ("orders" -> "order") and, per the review fix,
+    -ing/-ed forms so they cannot bypass the guard: "shipping" -> "ship",
+    "buying" -> "buy", "delivered" -> "deliver", "negotiating" -> "negotiate",
+    "discounted" -> "discount", "confirmed" -> "confirm", "returning" ->
+    "return". The doubled-consonant and dropped-e reversals cover regular
+    English inflection; a fold only counts when the stem IS an order word.
+    """
+    candidates = [token, _singularize(token)]
+    if token.endswith("ing") and len(token) > 5:
+        base = token[:-3]
+        candidates += [base, base + "e"]
+        if len(base) > 2 and base[-1] == base[-2]:
+            candidates.append(base[:-1])
+    if token.endswith("ed") and len(token) > 4:
+        base = token[:-2]
+        candidates += [base, base + "e", base + "y"]
+        if len(base) > 2 and base[-1] == base[-2]:
+            candidates.append(base[:-1])
+        if base.endswith("i"):
+            candidates.append(base[:-1] + "y")
+    for candidate in candidates:
+        if candidate in ORDER_WORDS:
+            return candidate
+    return None
+
+
 def _order_words_in(tokens: list[str]) -> list[str]:
-    """(b) Order/intent words present (plural forms folded to the singular)."""
+    """(b) Order/intent words present, with -ing/-ed/-s inflections folded."""
     found = []
     for token in tokens:
-        if token in ORDER_WORDS or _singularize(token) in ORDER_WORDS:
-            if token not in found:
-                found.append(token)
+        if _fold_to_order_stem(token) is not None and token not in found:
+            found.append(token)
     return found
 
 

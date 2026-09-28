@@ -57,16 +57,19 @@ def _make_context() -> ShopContext:
     return ShopContext(shop="Al-Noor Electronics", currency="PKR", customer_id="CUST-LIVE", tier="walk_in")
 
 
-def _tool_sentence(ctx_wrapper: RunContextWrapper[ShopContext], sku: str, name: str) -> str:
-    """The fixed template sentence the lookup tools produce for one product.
+def _tool_sentences(
+    ctx_wrapper: RunContextWrapper[ShopContext], sku: str, name: str
+) -> tuple[str, str]:
+    """The fixed template sentences the two lookup tools produce for one product.
 
-    lookup_product(sku) and check_stock_by_name(name) render the same product
-    through the same template, so either tool call must yield this exact text.
+    These are plain catalogue reads (the impl helpers never raise, NFR-4); the
+    scenarios turn a divergence between them into a recorded failure instead
+    of crashing, so the PASS/FAIL summary always prints.
     """
-    by_sku = tools._lookup_product_impl(ctx_wrapper, sku)
-    by_name = tools._check_stock_by_name_impl(ctx_wrapper, name)
-    assert by_sku == by_name, "tool templates diverged — evidence below is not stable"
-    return by_sku
+    return (
+        tools._lookup_product_impl(ctx_wrapper, sku),
+        tools._check_stock_by_name_impl(ctx_wrapper, name),
+    )
 
 
 def _print_triage(text: str) -> triage.FastPathDecision:
@@ -102,12 +105,14 @@ async def scenario_1(ctx: ShopContext, wrapper: RunContextWrapper[ShopContext]) 
         return [f"scenario 1 run failed: {exc}"]
     calls = len(result.raw_responses)
     final = result.final_output
-    expected = _tool_sentence(wrapper, "KTL-01", "kettle")
+    by_sku, by_name = _tool_sentences(wrapper, "KTL-01", "kettle")
+    expected = by_sku
     print(f"  model calls  : {calls}   (len(result.raw_responses))")
     print(f"  final answer : {final!r}")
     print(f"  tool template: {expected!r}")
     print(f"  active model : {agent.model.active_model_name}")
     _check(failures, "triage routed to the fast path", decision.is_fast_path and decision.sku == "KTL-01")
+    _check(failures, "lookup tools share one template for the product", by_sku == by_name)
     _check(failures, "exactly 1 model call", calls == 1, f"observed {calls}")
     _check(failures, "final output IS the tool's template sentence", final == expected)
     return failures
@@ -127,13 +132,17 @@ async def scenario_2(ctx: ShopContext, wrapper: RunContextWrapper[ShopContext]) 
         return [f"scenario 2 run failed: {exc}"]
     calls = len(result.raw_responses)
     final = str(result.final_output)
+    by_sku, by_name = _tool_sentences(wrapper, "FAN-22", "pedestal fan")
+    expected = by_sku
     print(f"  model calls  : {calls}   (len(result.raw_responses))")
     print(f"  final answer : {final!r}")
-    print(f"  tool template: {_tool_sentence(wrapper, 'FAN-22', 'pedestal fan')!r}")
+    print(f"  tool template: {expected!r}")
     print(f"  active model : {agent.model.active_model_name}")
     _check(failures, "triage routed to the fast path", decision.is_fast_path and decision.sku == "FAN-22")
+    _check(failures, "lookup tools share one template for the product", by_sku == by_name)
     _check(failures, "exactly 1 model call", calls == 1, f"observed {calls}")
     _check(failures, "out-of-stock wording, no availability claim", "out of stock" in final.lower())
+    _check(failures, "final output IS the tool's template sentence", final == expected)
     return failures
 
 

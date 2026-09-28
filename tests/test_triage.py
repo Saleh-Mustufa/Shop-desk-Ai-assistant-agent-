@@ -8,15 +8,36 @@ chains through model_config (the Gemini client is built lazily on first use).
 
 from __future__ import annotations
 
+import asyncio
 import datetime
+import json
+from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import pytest
-from agents import Agent, RunContextWrapper
+from agents import (
+    Agent,
+    AgentOutputSchemaBase,
+    Handoff,
+    Model,
+    ModelResponse,
+    ModelSettings,
+    ModelTracing,
+    RunContextWrapper,
+    Runner,
+    Tool,
+    set_tracing_disabled,
+)
+from agents.items import TResponseInputItem
+from agents.usage import Usage
+from openai.types.responses import ResponseFunctionToolCall
 
 import agents_desk
+import catalogue
 import model_config
 import prompts
+import tools
 import triage
 from context import ShopContext
 
@@ -197,3 +218,173 @@ def test_singletons_are_cached_and_resettable():
 @pytest.mark.parametrize("factory", [agents_desk.make_fastpath_agent, agents_desk.make_desk_agent])
 def test_factories_build_fresh_agents(factory):
     assert factory() is not factory()
+
+
+# ---------------------------------------------------------------------------
+# Review fix round 1: -ing/-ed/-s inflections cannot bypass the order guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Is shipping available for the fan?",  # review finding 1, case 1
+        "How much is shipping for the kettle?",  # review finding 1, case 2
+        "Are delivery options available for the kettle?",  # review finding 1, case 3
+        "Can I get a refund on the fan?",
+        "The kettle was discounted, how much is it now?",
+        "Two kettles were delivered yesterday, what did they cost?",
+    ],
+)
+def test_inflected_order_words_go_to_desk(text):
+    decision = triage.classify(text)
+    assert decision.is_fast_path is False
+    assert decision.sku is None and decision.product_name is None
+
+
+@pytest.mark.parametrize(
+    ("word", "stem"),
+    [
+        ("shipping", "ship"),
+        ("buying", "buy"),
+        ("delivered", "deliver"),
+        ("negotiating", "negotiate"),
+        ("discounted", "discount"),
+        ("confirmed", "confirm"),
+        ("returning", "return"),
+        ("purchased", "purchase"),
+        ("refunded", "refund"),
+        ("quoted", "quote"),
+        ("orders", "order"),
+        ("refunds", "refund"),
+        ("deliveries", "delivery"),
+    ],
+)
+def test_order_word_inflections_fold_to_stems(word, stem):
+    assert triage._fold_to_order_stem(word) == stem
+
+
+@pytest.mark.parametrize(
+    "word", ["electric", "blender", "kettle", "hello", "led", "does", "fanned", "evening"]
+)
+def test_inflection_folding_does_not_touch_normal_words(word):
+    assert triage._fold_to_order_stem(word) is None
+
+
+@pytest.mark.parametrize(
+    ("text", "fast", "sku"),
+    [
+        ("What does the kettle cost?", True, "KTL-01"),
+        ("How much is the blender?", True, "BLD-07"),
+        ("Can I order two kettles?", False, None),
+        ("What's the price of the kettle and the fan?", False, None),
+        ("Do you have TVs in stock?", True, "TV-43S"),
+        ("hello", False, None),
+        ("FAN-22?", True, "FAN-22"),
+        ("What's the price of a juicer?", False, None),
+    ],
+)
+def test_brief_required_scenarios_unchanged_after_fix(text, fast, sku):
+    """The 8 scenarios the task brief mandates behave exactly as specified."""
+    decision = triage.classify(text)
+    assert decision.is_fast_path is fast
+    assert decision.sku == sku
+
+
+# ---------------------------------------------------------------------------
+# Review fix round 1: the one-model-call guarantee, pinned offline
+# ---------------------------------------------------------------------------
+
+
+class _ToolCallFakeModel(Model):
+    """Fake SDK Model that always answers with one lookup tool call.
+
+    Same scripting shape as tests/test_router.py's FakeModel, but it emits a
+    single ResponseFunctionToolCall so Runner executes the REAL lookup tool
+    against the fixture catalogue — no network, no API key.
+    """
+
+    def __init__(self, tool_name: str, arguments: str) -> None:
+        self._tool_name = tool_name
+        self._arguments = arguments
+        self.calls = 0
+
+    async def get_response(
+        self,
+        system_instructions: str | None,
+        input: str | list[TResponseInputItem],
+        model_settings: ModelSettings,
+        tools: list[Tool],
+        output_schema: AgentOutputSchemaBase | None,
+        handoffs: list[Handoff],
+        tracing: ModelTracing,
+        *,
+        previous_response_id: str | None = None,
+        conversation_id: str | None = None,
+        prompt: Any = None,
+    ) -> ModelResponse:
+        self.calls += 1
+        call = ResponseFunctionToolCall(
+            arguments=self._arguments,
+            call_id="call_1",
+            name=self._tool_name,
+            type="function_call",
+            id="fc_1",
+            status="completed",
+        )
+        return ModelResponse(
+            output=[call],
+            usage=Usage(requests=1, input_tokens=1, output_tokens=1, total_tokens=3),
+            response_id="resp_1",
+        )
+
+    def stream_response(
+        self, *args: Any, **kwargs: Any
+    ) -> AsyncIterator[Any]:
+        raise NotImplementedError("fake models do not stream")
+
+
+def test_fastpath_costs_exactly_one_model_call(tmp_path):
+    """FR-3 pinned offline (review fix round 1): through Runner with a fake
+    model, the fast-path agent makes EXACTLY one model call and the tool's
+    output IS the run's final output (stop_on_first_tool)."""
+    path = tmp_path / "catalogue.json"
+    path.write_text(
+        json.dumps(
+            {
+                "shop": "Test Mart",
+                "currency": "PKR",
+                "products": [
+                    {"sku": "KTL-01", "name": "Electric kettle 1.7L", "price": 4200, "stock": 12}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    catalogue.set_catalogue_path(path)
+    try:
+        fake = _ToolCallFakeModel("check_stock_by_name", '{"name": "kettle"}')
+        routed = model_config.RoutedModel(profile="fast", delegate_factory=lambda _name: fake)
+        agent = agents_desk.make_fastpath_agent().clone(model=routed)
+        assert agent.tool_use_behavior == "stop_on_first_tool"
+        ctx = make_ctx()
+        set_tracing_disabled(True)
+        try:
+            result = asyncio.run(
+                Runner.run(
+                    agent,
+                    "What does the kettle cost?",
+                    context=ctx,
+                    max_turns=agents_desk.FASTPATH_MAX_TURNS,
+                )
+            )
+        finally:
+            set_tracing_disabled(False)
+        expected = tools._check_stock_by_name_impl(RunContextWrapper(context=ctx), "kettle")
+        assert fake.calls == 1  # the fake would serve any second model call
+        assert len(result.raw_responses) == 1  # trace evidence (FR-3)
+        assert result.final_output == expected  # the tool's output IS the answer
+        assert "12 in stock" in str(result.final_output)
+    finally:
+        catalogue.set_catalogue_path(catalogue.DEFAULT_CATALOGUE_PATH)
+        catalogue.reset_catalogue_cache()
