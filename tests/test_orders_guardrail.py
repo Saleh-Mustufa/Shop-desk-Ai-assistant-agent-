@@ -292,6 +292,48 @@ def test_guardrail_passes_neutral_out_of_stock_mention(fixture_catalogue, run_wr
     assert result.output_info["reason"] == "ok"
 
 
+def test_guardrail_passes_trailing_letter_sku_with_real_price(
+    fixture_catalogue, run_wrapper
+):
+    # TV-43S (optional trailing letter in the SKU pattern) with its real price.
+    result = catalogue_output_guardrail(
+        run_wrapper, AGENT, "The 43-inch LED smart TV (TV-43S) costs PKR 74,500."
+    )
+    assert result.tripwire_triggered is False
+    assert result.output_info["reason"] == "ok"
+
+
+def test_guardrail_trips_on_invented_trailing_letter_sku(
+    fixture_catalogue, run_wrapper
+):
+    result = catalogue_output_guardrail(
+        run_wrapper, AGENT, "The TV-55S is a great deal for you."
+    )
+    assert result.tripwire_triggered is True
+    assert "TV-55S" in result.output_info["unknown_skus"]
+    assert "unknown_sku" in result.output_info["reason"]
+
+
+def test_guardrail_trips_on_lowercase_sku_spelling(fixture_catalogue, run_wrapper):
+    # Matches must exist EXACTLY (case-sensitive): "fan-22" is not the
+    # catalogue's canonical "FAN-22", so it trips as an unknown SKU.
+    result = catalogue_output_guardrail(
+        run_wrapper, AGENT, "The fan-22 is ready for pickup."
+    )
+    assert result.tripwire_triggered is True
+    assert "fan-22" in result.output_info["unknown_skus"]
+    assert "unknown_sku" in result.output_info["reason"]
+
+
+def test_guardrail_passes_unavailable_out_of_stock_item(fixture_catalogue, run_wrapper):
+    # "unavailable" must NOT read as availability (word-boundary fix).
+    result = catalogue_output_guardrail(
+        run_wrapper, AGENT, "The pedestal fan (FAN-22) is currently unavailable."
+    )
+    assert result.tripwire_triggered is False
+    assert result.output_info["reason"] == "ok"
+
+
 # ---------------------------------------------------------------------------
 # (g) Guardrail Order path
 # ---------------------------------------------------------------------------

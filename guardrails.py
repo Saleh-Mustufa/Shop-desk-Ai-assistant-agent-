@@ -40,14 +40,26 @@ POLITE_REFUSAL = (
     "I'm sorry, I can't quote that — let me re-check our catalogue and get right back to you."
 )
 
-# Product codes like KTL-01, FAN-22, TV-43S.
-SKU_PATTERN = re.compile(r"\b[A-Z]{2,4}-\d{2,3}\b")
+# Product codes like KTL-01, FAN-22, TV-43S (optional trailing letter), so the
+# catalogue's own TV-43S is visible and invented/lowercase spellings such as
+# "TV-55S" or "fan-22" enter the unknown-SKU check (matched EXACTLY,
+# case-sensitive, against the catalogue's canonical SKU).
+SKU_PATTERN = re.compile(r"\b[A-Za-z]{2,4}-\d{2,3}[A-Za-z]?\b")
 # Currency amounts: captures the figure after PKR / Rs. / pkr markers.
 AMOUNT_PATTERN = re.compile(r"(?:PKR|Rs\.?|pkr)\s*([\d,]+(?:\.\d+)?)", re.IGNORECASE)
-# Phrases that imply an item is available for sale.
-AVAILABILITY_PATTERN = re.compile(r"(in stock|available|can (be )?order|we (have|sell))", re.IGNORECASE)
+# Phrases that imply an item is available for sale. Word boundaries on both
+# sides so "available" inside "unavailable" does NOT read as availability.
+AVAILABILITY_PATTERN = re.compile(
+    r"\b(in stock|available|can (be )?order|we (have|sell))\b", re.IGNORECASE
+)
 # Small integer tokens (bounded: only 1..20 are used as quantity candidates).
 QTY_TOKEN_PATTERN = re.compile(r"\b(\d{1,2})\b")
+# KNOWN LIMITATION (deferred by spec owner): checks are sentence-scoped. A
+# price stated in a different sentence from its SKU is judged only against
+# global catalogue prices (aggregates do not carry across sentences), and an
+# availability phrase never reaches a zero-stock SKU named in another
+# sentence. Acceptable for the desk's short single-topic replies; revisit if
+# multi-sentence quotes become common.
 _SENTENCE_SPLIT = re.compile(r"[.!?;\n]+")
 
 AMOUNT_TOLERANCE = 0.01
@@ -93,7 +105,10 @@ def _check_text(text: str) -> dict[str, list[Any]]:
         mentioned: dict[str, dict[str, Any]] = {}
         for sku in SKU_PATTERN.findall(sentence):
             product = catalogue.get_product(sku)
-            if product is None:
+            # Exact, case-sensitive existence: "fan-22" resolves via the
+            # case-insensitive accessor but is not the catalogue's canonical
+            # "FAN-22", so it is treated as an unknown SKU and trips.
+            if product is None or str(product.get("sku", "")) != sku:
                 if sku not in unknown_skus:
                     unknown_skus.append(sku)
             else:
