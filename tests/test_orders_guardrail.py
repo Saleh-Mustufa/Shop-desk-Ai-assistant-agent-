@@ -15,6 +15,7 @@ import pytest
 from agents import Agent, GuardrailFunctionOutput, RunContextWrapper
 
 import catalogue
+import guardrails
 import orders
 from context import ShopContext
 from guardrails import POLITE_REFUSAL, catalogue_output_guardrail
@@ -332,6 +333,54 @@ def test_guardrail_passes_unavailable_out_of_stock_item(fixture_catalogue, run_w
     )
     assert result.tripwire_triggered is False
     assert result.output_info["reason"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# (f2) Whole-text aggregate window + period-aware splitter (fix round 2)
+# ---------------------------------------------------------------------------
+
+BULK_QUOTE_ANSWER = (
+    "The Electric kettle 1.7L (KTL-01) is PKR 4,200. "
+    "A quote for 4 kettles comes to PKR 16,800."
+)
+
+
+def test_period_inside_product_name_is_not_a_sentence_boundary(
+    fixture_catalogue, run_wrapper
+):
+    text = "The Electric kettle 1.7L (KTL-01) is PKR 4,200 and we have 12 in stock."
+    assert len(guardrails._sentences(text)) == 1  # "1.7L" no longer splits
+    result = catalogue_output_guardrail(run_wrapper, AGENT, text)
+    assert result.tripwire_triggered is False
+    assert result.output_info["reason"] == "ok"
+
+
+def test_two_sentence_bulk_quote_passes(fixture_catalogue, run_wrapper):
+    # The aggregate sentence has no SKU token; the whole-text window carries
+    # KTL-01 (named in the first sentence) and the qty token 4 across.
+    result = catalogue_output_guardrail(run_wrapper, AGENT, BULK_QUOTE_ANSWER)
+    assert result.tripwire_triggered is False
+    assert result.output_info["reason"] == "ok"
+
+
+def test_name_only_bulk_quote_passes_without_sku_token(fixture_catalogue, run_wrapper):
+    # Name word "kettle" maps to KTL-01 (catalogue price 4200); 4200 x 4 = 16800.
+    result = catalogue_output_guardrail(
+        run_wrapper, AGENT, "4 kettles come to PKR 16,800"
+    )
+    assert result.tripwire_triggered is False
+    assert result.output_info["reason"] == "ok"
+
+
+def test_invented_aggregate_still_trips(fixture_catalogue, run_wrapper):
+    # 6900 x 5 = 34500 is the only legit candidate; 99,999 is not catalogue-derived.
+    result = catalogue_output_guardrail(
+        run_wrapper, AGENT, "5 blenders come to PKR 99,999"
+    )
+    assert result.tripwire_triggered is True
+    assert 99999.0 in result.output_info["bad_amounts"]
+    assert "unverifiable_amount" in result.output_info["reason"]
+    assert result.output_info["unknown_skus"] == []
 
 
 # ---------------------------------------------------------------------------
