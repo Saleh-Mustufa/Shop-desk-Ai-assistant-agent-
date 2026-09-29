@@ -312,6 +312,10 @@ async def run_desk_turn(
       (machine-readable ``output_info`` logged; ledger marked guardrailed)
     - router chain exhausted -> :data:`SYSTEM_BUSY`
     - other Agents SDK errors -> :data:`GENERIC_SORRY`
+    - ANY other unexpected error -> :data:`GENERIC_SORRY` (logged with
+      ``exc_info``): the catch-all makes NFR-4 unconditional. It deliberately
+      does NOT catch ``asyncio.CancelledError`` (a ``BaseException`` since
+      Python 3.8, so ``except Exception`` never swallows task cancellation).
     """
     hooks = ShopDeskHooks(ledger=ledger, budget=budget)
     run_config: RunConfig | None = None
@@ -347,6 +351,13 @@ async def run_desk_turn(
             return GENERIC_SORRY
         except AgentsException:
             logger.error("agent run failed; ending the turn politely", exc_info=True)
+            return GENERIC_SORRY
+        except Exception:  # noqa: BLE001 — NFR-4: no traceback ever reaches the customer
+            # Final catch-all AFTER the SDK-specific ladder: any non-SDK error
+            # (a bug in a tool/hook, an unexpected RuntimeError) still ends the
+            # turn politely. asyncio.CancelledError is a BaseException, so task
+            # cancellation is NOT swallowed here.
+            logger.error("unexpected error during the agent run; ending the turn politely", exc_info=True)
             return GENERIC_SORRY
         return result.final_output
     finally:
