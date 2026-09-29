@@ -3,7 +3,9 @@
 The desk agent's system prompt is rebuilt every turn from the ShopContext
 fields (shop name, currency, tier-aware tool mentions) plus the simulated
 clock: inside shop hours it promises same-day delivery; outside hours it says
-the shop is closed and gives the opening time.
+the shop is closed and gives the opening time. FR-10 adds one escalation
+paragraph: when to use the escalate_to_human tool and which typed reason
+codes exist.
 
 FR-2: context is read to build the prompt, but the customer_id is NEVER
 included in any prompt text.
@@ -84,7 +86,13 @@ def build_desk_prompt(ctx: ShopContext, now: _dt.datetime) -> str:
         "with the customer first.\n"
         "- Only when the customer clearly confirms the full order, call the "
         "finalize-order flow so the order-taking step takes over.\n"
-        "- Be warm and concise; write in customer-ready sentences."
+        "- Be warm and concise; write in customer-ready sentences.\n\n"
+        "If the customer asks for a human, or their request is outside what "
+        "you can help with (e.g. complaints about third-party services, legal "
+        "questions, anything you cannot resolve), use the escalate_to_human "
+        "tool and pass the matching reason (out_of_scope, order_problem, "
+        "customer_request, policy, repeated_failure). Tell the customer a "
+        "human colleague is taking over."
     )
 
 
