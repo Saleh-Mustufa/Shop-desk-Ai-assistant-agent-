@@ -10,14 +10,15 @@ What this module provides:
   no 401 noise in the logs. When ``OPENAI_API_KEY`` IS set (checked at call
   time), a ``BatchTraceProcessor(BackendSpanExporter())`` is appended so the
   same traces also upload to the OpenAI platform under the user's own key.
-- :class:`JsonlTraceProcessor` — buffers finished spans per trace; when the
-  trace ends it writes ``traces/<trace_id>.json`` containing the trace id,
-  workflow name, group id, metadata and one record per span (name/type,
-  started_at/ended_at, parent_id, and for model spans the model name plus
-  usage token counts, extracted defensively — usage may be a dict or an
-  object depending on the span data type, and may be missing entirely). The
-  processor NEVER raises into the app: every I/O step is wrapped and
-  failures are logged to ``shopdesk.tracing``.
+- :class:`JsonlTraceProcessor` — buffers finished spans per trace; when a
+  trace ends it REWRITES ``traces/<trace_id>.json`` with the WHOLE accumulated
+  buffer for that trace id (merge semantics, see the class docstring), so the
+  file holds the trace id, workflow name, group id, metadata and one record
+  per span (name/type, started_at/ended_at, parent_id, and for model spans
+  the model name plus usage token counts, extracted defensively — usage may
+  be a dict or an object depending on the span data type, and may be missing
+  entirely). The processor NEVER raises into the app: every I/O step is
+  wrapped and failures are logged to ``shopdesk.tracing``.
 - :func:`conversation_trace` — the FR-13 context manager: ONE
   ``agents.trace(workflow_name="shop-desk-conversation", group_id=session_id)``
   spanning a whole conversation (every turn's ``Runner.run``, including the
@@ -56,6 +57,7 @@ from agents.tracing.setup import get_trace_provider
 __all__ = [
     "TRACES_DIR",
     "WORKFLOW_NAME",
+    "MAX_COMPLETED_TRACE_BUFFERS",
     "JsonlTraceProcessor",
     "conversation_trace",
     "get_trace_processor",
@@ -74,6 +76,12 @@ WORKFLOW_NAME = "shop-desk-conversation"
 
 # The SDK's own trace-id shape (gen_trace_id: "trace_" + uuid4().hex).
 _TRACE_ID_RE = re.compile(r"^trace_[0-9a-f]{32}$")
+
+# Memory bound for merge semantics: completed traces' span buffers are kept
+# only for the last 4 completed trace ids (LRU-evicted after each write), so
+# the UI's per-turn scopes can share one id and still accumulate without the
+# memory growing with the number of conversations.
+MAX_COMPLETED_TRACE_BUFFERS = 4
 
 _PROCESSOR: "JsonlTraceProcessor | None" = None
 _PROCESSOR_LOCK = threading.Lock()
@@ -151,15 +159,33 @@ def _span_record(span: Any) -> dict[str, Any] | None:
 
 
 class JsonlTraceProcessor(TracingProcessor):
-    """Buffers finished spans per trace; on trace end writes one JSON file.
+    """Buffers finished spans per trace; on trace end rewrites one JSON file.
 
-    The file (``traces/<trace_id>.json``) holds the trace id, workflow name,
-    group id, metadata and the span records gathered via :func:`_span_record`.
+    MERGE SEMANTICS — one trace file per conversation trace id; repeated
+    scopes with the same id merge into it: the in-memory buffer for a trace
+    id is NOT popped on trace end. Every trace end REWRITES
+    ``traces/<trace_id>.json`` with the WHOLE accumulated buffer for that id,
+    in span-arrival order. A trace opened once and closed once (the demo
+    script's single scope) behaves exactly as before; multiple scopes that
+    share one trace id — the Chainlit app opens one scope per turn with the
+    session-derived id — produce ONE file containing ALL of the
+    conversation's spans, so the browser path satisfies FR-13 too (fast-path
+    and reasoning turns are all in the file).
+
+    Memory stays bounded: after writing, only the last
+    :data:`MAX_COMPLETED_TRACE_BUFFERS` (4) COMPLETED trace ids keep their
+    buffers (LRU eviction, oldest first); a conversation resumed after its
+    buffer was evicted starts a fresh buffer and rewrites the file with the
+    new scope's spans only — the accepted trade for bounded memory. In-flight
+    traces are never evicted by completion (they are dropped by
+    :meth:`shutdown`).
+
     Completed traces are summarized in memory (trace_id, group_id, n_spans,
     total_tokens — model-span tokens only, so the SDK's task/turn usage
     aggregates never double count) — :meth:`last_trace_summary` exposes the
     most recent one for programmatic assertions and for the session layer's
-    FR-13 proof line.
+    FR-13 proof line. With repeated scopes one trace id yields one summary
+    per scope end, each reflecting the file as accumulated so far.
     """
 
     def __init__(self, output_dir: str | Path | None = None) -> None:
@@ -169,6 +195,9 @@ class JsonlTraceProcessor(TracingProcessor):
         self._lock = threading.Lock()
         self._spans_by_trace: dict[str, list[dict[str, Any]]] = {}
         self._summaries: list[dict[str, Any]] = []
+        # Completed trace ids, most recent last — the LRU order for buffer
+        # eviction after writing.
+        self._completed_order: list[str] = []
 
     # -- configuration -----------------------------------------------------
 
@@ -197,14 +226,26 @@ class JsonlTraceProcessor(TracingProcessor):
             logger.exception("tracing: failed to buffer a finished span; the span is dropped")
 
     def on_trace_end(self, trace: Trace) -> None:
-        """Persist the whole trace as one JSON file; never raises."""
+        """Persist the trace as one JSON file (accumulate-and-rewrite); never raises.
+
+        The in-memory buffer for the trace id is NOT popped: the file is
+        rewritten with the WHOLE buffer for that id, so repeated scopes
+        sharing one trace id (the UI's per-turn scopes) merge into ONE file
+        holding every span of the conversation, in arrival order. After
+        writing, completed buffers are LRU-evicted down to
+        :data:`MAX_COMPLETED_TRACE_BUFFERS` (the file always exists before
+        its buffer may be dropped).
+        """
         trace_id = "?"  # resolved inside the try; keeps the except handler safe
         try:
             candidate = getattr(trace, "trace_id", None)
             if isinstance(candidate, str) and candidate:
                 trace_id = candidate
             with self._lock:
-                spans = self._spans_by_trace.pop(trace_id, [])
+                spans = list(self._spans_by_trace.get(trace_id, []))
+                if trace_id in self._completed_order:
+                    self._completed_order.remove(trace_id)
+                self._completed_order.append(trace_id)
             payload = {
                 "trace_id": trace_id,
                 "workflow_name": getattr(trace, "name", None),
@@ -236,7 +277,17 @@ class JsonlTraceProcessor(TracingProcessor):
             }
             with self._lock:
                 self._summaries.append(summary)
-            logger.info("trace persisted: %s (%d spans)", path, len(spans))
+                # LRU-evict the OLDEST completed trace buffers AFTER writing,
+                # so the file is always on disk before its buffer may go.
+                while len(self._completed_order) > MAX_COMPLETED_TRACE_BUFFERS:
+                    oldest = self._completed_order.pop(0)
+                    self._spans_by_trace.pop(oldest, None)
+            logger.info(
+                "trace persisted: %s (%d spans, %d buffer(s) retained)",
+                path,
+                len(spans),
+                len(self._spans_by_trace),
+            )
         except Exception:  # noqa: BLE001 — a broken trace write must never break a turn
             logger.exception("tracing: failed to persist trace %r", trace_id)
 
@@ -244,10 +295,16 @@ class JsonlTraceProcessor(TracingProcessor):
         """Everything is written synchronously at trace end; nothing to flush."""
 
     def shutdown(self) -> None:
-        """Drop any never-finished trace buffers (clean close; summaries stay)."""
+        """Drop all in-memory span buffers (clean close; summaries stay).
+
+        Completed buffers linger up to :data:`MAX_COMPLETED_TRACE_BUFFERS`
+        for merge semantics; shutdown clears them and any never-finished
+        traces alike (files for completed traces are already on disk).
+        """
         try:
             with self._lock:
                 self._spans_by_trace.clear()
+                self._completed_order.clear()
         except Exception:  # noqa: BLE001
             logger.exception("tracing: processor shutdown failed to clear buffers")
 

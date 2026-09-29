@@ -426,6 +426,81 @@ def test_most_expensive_turn_identifiable_by_usage(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# (c2) the UI pattern: repeated scopes sharing one trace id MERGE into one file
+# ---------------------------------------------------------------------------
+
+
+def test_repeated_scopes_sharing_one_trace_id_merge_into_one_file(tmp_path):
+    """The Chainlit app opens ONE trace scope per turn (per-handler tasks)
+    with the same deterministic conversation id. The processor must MERGE
+    the per-turn scopes into ONE file holding BOTH turns' spans — not
+    overwrite the file with only the last turn's spans (FR-13 in the UI)."""
+    processor = tracing_setup.JsonlTraceProcessor(output_dir=tmp_path)
+    set_trace_processors([processor])  # exactly this (fresh) processor
+
+    fast_fake = _SpanningFakeModel(
+        "The Electric kettle 1.7L (KTL-01) costs PKR 4,200 and we have 12 in stock.",
+        model_name="fake-lite",
+        usage=Usage(requests=1, input_tokens=11, output_tokens=7, total_tokens=18),
+    )
+    desk_fake = _SpanningFakeModel(
+        "Blenders are on aisle 3.",
+        model_name="fake-desk",
+        usage=Usage(requests=1, input_tokens=20, output_tokens=10, total_tokens=30),
+    )
+    fast_agent = Agent(name="FastPath", model=_routed_fake(fast_fake))
+    desk_agent = Agent(name="ShopDesk", model=_routed_fake(desk_fake))
+    ledger = ConversationLedger()
+    budget = ConversationBudget(max_model_calls=10)
+    ctx = make_ctx()
+
+    conversation_id = "fix-round-ui-conversation"
+    trace_id = tracing_setup._derive_trace_id(conversation_id)  # noqa: SLF001
+    path = tmp_path / f"{trace_id}.json"
+
+    # Turn 1 (fast path) in its OWN scope, like one on_message task.
+    with tracing_setup.conversation_trace("sess-UI", conversation_id=conversation_id):
+        first = asyncio.run(
+            run_desk_turn(fast_agent, "What does the kettle cost?", ctx, ledger, budget)
+        )
+    assert first == fast_fake.text
+    # Scope 1 alone: the file already exists with turn 1's model span.
+    first_payload = json.loads(path.read_text(encoding="utf-8"))
+    assert sorted(
+        span["model"] for span in first_payload["spans"] if "model" in span
+    ) == ["fake-lite"]
+
+    # Turn 2 (desk) in ANOTHER scope with the SAME conversation id.
+    with tracing_setup.conversation_trace("sess-UI", conversation_id=conversation_id):
+        second = asyncio.run(
+            run_desk_turn(desk_agent, "tell me about blenders", ctx, ledger, budget)
+        )
+    assert second == desk_fake.text
+
+    # ONE file for the trace id (not one per scope), holding BOTH scopes.
+    assert [entry.name for entry in tmp_path.glob("*.json")] == [path.name]
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["trace_id"] == trace_id
+    assert payload["group_id"] == "sess-UI"
+    assert payload["n_spans"] == len(payload["spans"]) > len(first_payload["spans"])
+    model_spans = [span for span in payload["spans"] if "model" in span]
+    assert sorted(span["model"] for span in model_spans) == [
+        "fake-desk",
+        "fake-lite",
+    ]  # spans from BOTH scopes, arrival order kept
+    totals = sorted(span["usage"]["total_tokens"] for span in model_spans)
+    assert totals == [18, 30]  # fast-path turn + desk turn, both with usage
+    assert sum(totals) == 18 + 30 == 48  # the whole conversation's usage
+    # The processor's summary reflects the merged file...
+    summary = processor.last_trace_summary()
+    assert summary["trace_id"] == trace_id
+    assert summary["n_spans"] == payload["n_spans"]
+    assert summary["total_tokens"] == 48
+    # ...and the buffer was retained (not popped), bounded by the LRU cap.
+    assert list(processor._spans_by_trace) == [trace_id]  # noqa: SLF001
+
+
+# ---------------------------------------------------------------------------
 # (d) the processor never raises into the app
 # ---------------------------------------------------------------------------
 
