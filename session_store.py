@@ -24,27 +24,38 @@ THE TRIMMING RULE (FR-12, stated here and in the README):
     When the history grows past that, drop the OLDEST messages first, but
     never drop (a) any message of the CURRENT pending-order discussion —
     every message appended while the basket is non-empty, up to the order
-    confirmation that empties it — and never drop (b) the last
-    :data:`LAST_EXCHANGES_KEPT` (2) exchanges. If the protections alone
-    exceed the cap the history keeps growing (protections win; the cap is
-    soft in that case).
+    confirmation (or an explicit basket clear / full removal) that empties
+    it — and never drop (b) the last :data:`LAST_EXCHANGES_KEPT` (2)
+    exchanges. If the protections alone exceed the cap the history keeps
+    growing (protections win; the cap is soft in that case).
+
+    The trimmed history has a REAL consumer: the desk model's per-turn input
+    IS the trimmed history (see :meth:`DeskSession._desk_input`), so what
+    trimming throws away first is literally what the model stops seeing —
+    the oldest tool-free Q&A.
 
     Justification: plain Q&A is re-derivable from the catalogue cheaply —
     every turn's tools re-fetch catalogue truth anyway — so the oldest
     tool-free Q&A is the safest thing to lose. Order context is NOT
     re-derivable from the catalogue (the basket lives in session state), so
     it is protected while the order is pending. The basket itself is ALSO
-    re-injected into the desk input every turn (see below), so even a
+    re-stated on the current turn every desk turn (see below), so even a
     dropped order message would not lose the basket — the protection is
     belt-and-braces on top of the recap.
 
-BASKET MEMORY AND FR-2: the desk agent's per-turn INPUT is prefixed with a
-short session-side recap (``[Session note] Current basket (pending):
-2x KTL-01 (Electric kettle 1.7L).``). This recap is conversation INPUT, not
-the system prompt, and it carries product SKUs/quantities only — the
-:class:`ShopContext` itself (customer_id, tier) still travels exclusively as
-the run context and is read by tools via the wrapper; no customer identifier
-is ever placed in prompt/input text (FR-2).
+BASKET MEMORY, HISTORY AND FR-2: the desk agent's per-turn INPUT is the
+session's TRIMMED HISTORY, handed to the runner as role/content items
+(``{"role": "user" | "assistant", "content": str}`` — the SDK's accepted
+input shape), with the CURRENT user message last and a short session-side
+recap PREPENDED TO THAT MESSAGE'S content (``[Session note] Current basket
+(pending): 2x KTL-01 (Electric kettle 1.7L).``). The recap is conversation
+INPUT, not the system prompt, and it carries product SKUs/quantities only —
+the :class:`ShopContext` itself (customer_id, tier) still travels
+exclusively as the run context and is read by tools via the wrapper; no
+customer identifier is ever placed in prompt/input text (FR-2). The FAST
+PATH deliberately stays single-shot: raw text only, no history and no recap
+— a self-contained one-call catalogue lookup (FR-3), which is exactly the
+turn kind that needs no dialogue memory.
 
 BASKET RULE (deterministic, zero-cost): the basket is updated in Python from
 explicit user statements parsed by :func:`parse_basket_statement` — patterns
@@ -362,6 +373,34 @@ class DeskSession:
             )
         return " ".join(parts)
 
+    def _desk_input(self) -> list[dict[str, str]]:
+        """The desk run input: the TRIMMED history + the recap on the current turn.
+
+        FR-12's "history is carried per session and trimmed past a turn
+        count" is realized HERE: the model input is the session's trimmed
+        history as SDK role/content items (``{"role": "user"|"assistant",
+        "content": str}`` — the shape the runner passes straight through to
+        ``Runner.run``, which accepts ``str | list[TResponseInputItem]``),
+        with the current user message LAST. The basket recap is prepended to
+        THAT message's content as a clearly marked ``[Session note]`` — one
+        item, so the model always knows what is conversation memory and what
+        is the customer speaking now. The recap is conversation input, not
+        the system prompt, and carries SKUs/quantities only (FR-2). The fast
+        path does NOT go through this method: it stays single-shot by design.
+        """
+        items = [dict(message) for message in self.history]  # copies: no aliasing
+        recap = self.basket_recap()
+        if recap:
+            note = f"[Session note] {recap}"
+            if items and items[-1].get("role") == "user":
+                items[-1] = {
+                    "role": "user",
+                    "content": f"{note}\n\n{items[-1]['content']}",
+                }
+            else:  # defensive: the current turn must never go missing
+                items.append({"role": "user", "content": note})
+        return items
+
     def _product_name(self, sku: str) -> str:
         product = catalogue.get_product(sku)
         return str(product.get("name", sku)) if product else sku
@@ -467,8 +506,12 @@ class DeskSession:
     async def handle_user_message(self, text: str) -> str:
         """One customer turn: confirm-check -> basket parse -> route -> reply.
 
-        Returns the assistant reply (always a customer-ready sentence); the
-        reply is also appended to the (trimmed) per-session history.
+        Desk turns send the TRIMMED history (recap on the current turn, see
+        :meth:`_desk_input`) to the desk agent; fast-path turns stay
+        single-shot; confirmations run pure Python with zero model calls
+        (FR-5). Returns the assistant reply (always a customer-ready
+        sentence); the reply is also appended to the (trimmed) per-session
+        history.
         """
         text = str(text or "").strip()
         self.turn_counter += 1
@@ -490,6 +533,11 @@ class DeskSession:
             logger.info(
                 "session %s: basket updated: %s x%d", self.session_id, sku, qty
             )
+        if not self.basket:
+            # The order discussion is over (confirmed, explicitly cleared, or
+            # fully removed): its messages stop being trim-protected, so dead
+            # order discussions cannot pin the history past the cap (FR-12).
+            self._order_flags = [False] * len(self._order_flags)
 
         if not text:
             reply = (
@@ -517,19 +565,26 @@ class DeskSession:
         # 3. Route: fast path (one model call) or the Desk's ordinary loop.
         decision = triage.classify(text)
         if decision.is_fast_path:
+            # Single-shot by design: raw text only, no history, no recap —
+            # the fast path is a self-contained one-call lookup (FR-3).
             self.last_route = f"fast-path ({decision.reason})"
             self.last_recap = None
             model_input = text
             agent = agents_desk.get_fastpath_agent()
             max_turns = agents_desk.FASTPATH_MAX_TURNS
         else:
+            # FR-12: trim FIRST so the desk model sees exactly the trimmed
+            # history; the just-appended user message sits inside the
+            # protected last exchange and always survives the trim.
+            self._trim_history()
             recap = self.basket_recap()
             self.last_recap = recap or None
             self.last_route = f"desk ({decision.reason})"
             # The recap is conversation INPUT (not the system prompt) and
             # carries SKUs/quantities only; the ShopContext still travels as
-            # the run context (FR-2).
-            model_input = f"[Session note] {recap}\n\n{text}" if recap else text
+            # the run context (FR-2). The rest of the input is the trimmed
+            # history itself (see _desk_input).
+            model_input = self._desk_input()
             agent = agents_desk.get_desk_agent()
             max_turns = 8
 

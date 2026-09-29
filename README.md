@@ -40,17 +40,28 @@ two histories, two ledgers. Nothing session-scoped is shared.
 > Keep at most **12 messages** (6 exchanges) per session. When the history
 > grows past that, drop the **oldest messages first**, but never drop (a) any
 > message of the *current pending-order discussion* (every message appended
-> while the basket is non-empty, up to the confirmation that empties it) and
-> never drop (b) the **last 2 exchanges**. If the protections alone exceed
-> the cap, the history keeps growing — protections win.
+> while the basket is non-empty, up to the confirmation — or an explicit
+> basket clear — that empties it) and never drop (b) the **last 2 exchanges**.
+> If the protections alone exceed the cap, the history keeps growing —
+> protections win.
+
+**What the model actually sees.** The trimmed history is not bookkeeping:
+it IS the Desk agent's per-turn input. Desk turns send the session's trimmed
+history to the runner as role/content items (`{"role": "user"|"assistant",
+"content": str}`) with the current user message last and a short
+`[Session note]` basket recap prepended to *that* message's content — so a
+dropped turn is one the model literally no longer sees, while the order
+discussion and the last 2 exchanges are always still in its input. Fast-path
+turns deliberately stay single-shot (raw question only, no history — a
+self-contained one-call catalogue lookup).
 
 **Justification.** Plain Q&A is re-derivable from the catalogue cheaply (every
 turn's tools re-fetch catalogue truth), so the oldest tool-free Q&A is the
 safest thing to lose. Order context is NOT re-derivable from the catalogue
 (the basket lives in session state), so it is protected while the order is
-pending. Independently of the history, the basket is also re-injected into
-the Desk agent's input every turn as a short `[Session note]` recap — that is
-what makes turn 11 remember the order under discussion even after trimming.
+pending. On top of the protected history, the basket recap is re-stated on
+the current turn of every desk call — that is what makes turn 11 remember the
+order under discussion even in a fresh context window.
 
 The recap is conversation INPUT, not prompt text, and carries SKUs and
 quantities only: the `ShopContext` (customer id, tier) still travels

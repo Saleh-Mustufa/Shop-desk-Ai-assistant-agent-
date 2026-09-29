@@ -166,6 +166,58 @@ def _routed_fake(fake: Model) -> model_config.RoutedModel:
     return model_config.RoutedModel(profile="fast", delegate_factory=lambda _name: fake)
 
 
+class _ScriptedTextModel(Model):
+    """Fake desk model with ONE scripted reply per call (the last repeats).
+
+    Unlike the shared fixture fakes (one fixed reply), per-call replies let a
+    test identify WHICH turn's text shows up in a LATER model input — the
+    FR-12 multi-turn memory assertions.
+    """
+
+    def __init__(self, replies: list[str]) -> None:
+        self._replies = list(replies)
+        self.calls = 0
+        self.inputs: list[Any] = []
+        self.usage = Usage(requests=1, input_tokens=2, output_tokens=3, total_tokens=5)
+
+    async def get_response(
+        self,
+        system_instructions: str | None,
+        input: str | list[TResponseInputItem],  # noqa: A002
+        model_settings: ModelSettings,
+        tools: list[Tool],
+        output_schema: AgentOutputSchemaBase | None,
+        handoffs: list[Any],
+        tracing: ModelTracing,
+        *,
+        previous_response_id: str | None = None,
+        conversation_id: str | None = None,
+        prompt: Any = None,
+    ) -> ModelResponse:
+        self.calls += 1
+        self.inputs.append(input)
+        reply = self._replies[min(self.calls, len(self._replies)) - 1]
+        message = ResponseOutputMessage(
+            id=f"msg_{self.calls}",
+            type="message",
+            role="assistant",
+            status="completed",
+            content=[ResponseOutputText(text=reply, type="output_text", annotations=[])],
+        )
+        return ModelResponse(
+            output=[message], usage=self.usage, response_id=f"resp_{self.calls}"
+        )
+
+    def stream_response(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        raise NotImplementedError("fake models do not stream")
+
+
+def _route_desk_to(monkeypatch, fake: Model) -> None:
+    """Point the session's desk agent at one fake model for this test."""
+    desk_agent = agents_desk.make_desk_agent().clone(model=_routed_fake(fake))
+    monkeypatch.setattr(agents_desk, "get_desk_agent", lambda: desk_agent)
+
+
 FAST_REPLY = "The Electric kettle 1.7L (KTL-01) costs PKR 4,200 and we have 12 in stock."
 DESK_REPLY = "Noted — anything else I can help with?"
 
@@ -439,6 +491,11 @@ def test_routing_fastpath_vs_desk(fake_agents):
     _turn(session, "How much is the kettle?")
     assert fake_fast.calls == 1 and fake_desk.calls == 0
     assert session.last_route is not None and session.last_route.startswith("fast-path")
+    # Fast path stays single-shot: the model input is the raw question only —
+    # no history and no basket recap (deliberate FR-3 design).
+    fast_input = _input_text(fake_fast.inputs[0])
+    assert "How much is the kettle?" in fast_input
+    assert "Session note" not in fast_input
 
     _turn(session, "What's your delivery like?")  # order word -> desk
     assert fake_desk.calls == 1 and fake_fast.calls == 1
@@ -469,3 +526,97 @@ def test_turn_eleven_still_remembers_the_basket_via_the_recap(fake_agents):
     assert "those kettles" in text  # the customer's own words travelled too
     # And the basket itself is intact (the trim never touches session state).
     assert session.basket == {"KTL-01": 2}
+
+
+# ---------------------------------------------------------------------------
+# (h) FR-12 has a real consumer: the desk model's input IS the trimmed history
+# ---------------------------------------------------------------------------
+
+
+def test_desk_input_carries_trimmed_history_and_drops_the_oldest(monkeypatch):
+    """The desk model receives the session's TRIMMED history as its input:
+    prior turns are present, the OLDEST turns are gone after trimming, and
+    order-context turns are retained (FR-12's rule applied to what the model
+    actually sees)."""
+    scripted = _ScriptedTextModel(
+        [
+            "NOTE-BLUE",  # t1 reply (distinct, to track it across turns)
+            *[f"REPLY-{n}" for n in range(2, 10)],  # t2..t9 replies
+            "BASKET-NOTED",  # t10 reply (the basket turn)
+            *[f"REPLY-{n}" for n in range(11, 16)],  # t11..t15 replies
+        ]
+    )
+    _route_desk_to(monkeypatch, scripted)
+    session = make_session()
+
+    _turn(session, "I like the midnight blue finish on the kettle")  # t1
+    for i in range(2, 10):
+        _turn(session, f"small talk {i}")  # t2..t9: plain Q&A
+    _turn(session, "I'll take 1 kettle")  # t10: basket -> order context on
+    for i in range(11, 16):
+        _turn(session, f"more chatter {i}")  # t11..t15
+    reply = _turn(session, "what finish was it again?")  # t16
+
+    assert reply == "REPLY-15"
+    input_text = _input_text(scripted.inputs[-1])
+    # The trimmed history IS the input: prior turns are present...
+    assert "BASKET-NOTED" in input_text  # t10's assistant reply retained
+    assert "I'll take 1 kettle" in input_text  # the order-context turn retained
+    assert "REPLY-15" in input_text  # the previous exchange retained
+    assert "more chatter" in input_text  # the retained Q&A is present
+    # ...while the OLDEST turns (dropped first by the trim rule) are NOT:
+    assert "NOTE-BLUE" not in input_text  # t1's reply was trimmed away
+    assert "small talk" not in input_text  # t2..t9 tool-free Q&A dropped first
+    # The recap rides on the CURRENT user message only, in the same input.
+    assert "Session note" in input_text
+    assert "1x KTL-01" in input_text
+    assert "what finish was it again?" in input_text
+
+
+def test_continuity_assistant_mention_recalled_two_turns_later(monkeypatch):
+    """FR-12 dialogue memory without product keywords: the assistant mentions
+    something in turn N; at turn N+2 the customer asks about it with no
+    product/price words at all, and the prior assistant text reaches the
+    model input."""
+    scripted = _ScriptedTextModel(
+        [
+            "We do free gift wrapping on kettles this month.",  # t1 mention
+            "REPLY-2",  # t2 filler reply
+        ]
+    )
+    _route_desk_to(monkeypatch, scripted)
+    session = make_session()
+
+    _turn(session, "By the way, is there any promotion running?")  # t1
+    _turn(session, "Nice.")  # t2
+    _turn(session, "can you repeat what you just said?")  # t3: no product words
+
+    input_text = _input_text(scripted.inputs[-1])
+    assert "free gift wrapping" in input_text  # turn 1's assistant text is input
+    assert "what you just said" in input_text  # the current turn travelled too
+
+
+def test_clearing_the_basket_lifts_order_protection(monkeypatch):
+    """Explicit clear/emptying resets the order-context flags, so a dead
+    order discussion stops being trim-protected and trimming resumes."""
+    scripted = _ScriptedTextModel(["KETTLE-NOTED", *[f"REPLY-{n}" for n in range(2, 30)]])
+    _route_desk_to(monkeypatch, scripted)
+    session = make_session()
+
+    _turn(session, "I'll take 1 kettle")  # t1: order context from turn 1 on
+    for i in range(2, 9):
+        _turn(session, f"small talk {i}")  # t2..t8
+    # Pinned: while the order is pending, the protection wins over the cap.
+    assert len(session.history) > MAX_HISTORY_MESSAGES
+    assert all(session.order_context_flags())
+
+    _turn(session, "please clear the basket")  # t9: explicit clear
+    assert session.basket == {}
+    assert not any(session.order_context_flags())  # flags reset (fix round 2)
+
+    _turn(session, "one more question")  # t10: trimming is live again
+    assert len(session.history) == MAX_HISTORY_MESSAGES  # cap enforced again
+    input_text = _input_text(scripted.inputs[-1])
+    assert "KETTLE-NOTED" not in input_text  # the dead discussion got trimmed
+    assert "I'll take 1 kettle" not in input_text
+    assert "one more question" in input_text  # the live turn is still there

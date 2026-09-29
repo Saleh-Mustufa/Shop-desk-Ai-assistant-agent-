@@ -44,6 +44,7 @@ import chainlit as cl
 
 import catalogue
 import config
+import runner_cost
 import session_store
 import tracing_setup
 from context import ShopContext
@@ -133,10 +134,17 @@ async def on_message(message: cl.Message) -> None:
     # FR-13: this per-turn scope shares the conversation's stable trace id,
     # so the processor MERGES it into the conversation's one trace file
     # (accumulate-and-rewrite — see the module docstring).
-    async with tracing_setup.conversation_trace(
-        session.session_id, conversation_id=session.session_id
-    ):
-        reply = await session.handle_user_message(message.content or "")
+    try:
+        async with tracing_setup.conversation_trace(
+            session.session_id, conversation_id=session.session_id
+        ):
+            reply = await session.handle_user_message(message.content or "")
+    except Exception:  # noqa: BLE001 — NFR-4: the user never sees a raw error
+        # handle_user_message maps every runner error to a polite sentence
+        # already; this net catches anything outside the run itself (a bug
+        # in session plumbing) with the same customer promise.
+        logger.exception("session %s: turn failed", session.session_id)
+        reply = runner_cost.GENERIC_SORRY
     await cl.Message(content=reply).send()
 
     if session.turn_counter % 10 == 0:

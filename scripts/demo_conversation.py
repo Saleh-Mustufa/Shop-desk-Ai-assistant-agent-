@@ -239,12 +239,14 @@ def main() -> int:
     )
     _check(
         failures,
-        "one trace file written for the conversation",
+        "one trace file written for the conversation (span floor: >= 2 x turns)",
         bool(summary)
         and trace_path is not None
         and trace_path.exists()
-        and str(summary.get("group_id", "")).startswith("demo-"),
-        f"group_id={summary.get('group_id')}",
+        and str(summary.get("group_id", "")).startswith("demo-")
+        and int(summary.get("n_spans", 0) or 0) >= 2 * turns,
+        f"group_id={summary.get('group_id')} n_spans={summary.get('n_spans')} "
+        f"(floor {2 * turns}; a near-empty trace file must FAIL)",
     )
     _check(
         failures,
